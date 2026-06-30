@@ -308,30 +308,46 @@ def _extract_zip_entry(zf: zipfile.ZipFile, archive_path: str, target: Path, mti
     temp_target.replace(target)
 
 
+def _is_session_record_path(relative_path: str) -> bool:
+    return relative_path.startswith("sessions/") or relative_path.startswith("archived_sessions/")
+
+
+def _should_repair_existing_record(target: Path, source_size: int, relative_path: str) -> bool:
+    if not _is_session_record_path(relative_path) or not target.is_file():
+        return False
+    try:
+        return target.stat().st_size < source_size
+    except OSError:
+        return False
+
+
 def _merge_jsonl(zf: zipfile.ZipFile, archive_path: str, target: Path) -> tuple[int, int]:
     target.parent.mkdir(parents=True, exist_ok=True)
-    seen_ids: set[str] = set()
-    needs_newline = False
+    ordered_ids: list[str] = []
+    items_by_id: dict[str, dict] = {}
+    raw_lines: list[str] = []
     if target.exists():
         with target.open("r", encoding="utf-8", errors="replace") as existing:
             for line in existing:
+                text = line.rstrip("\r\n")
+                if not text:
+                    continue
                 try:
-                    item = json.loads(line)
+                    item = json.loads(text)
                 except json.JSONDecodeError:
+                    raw_lines.append(text)
                     continue
                 item_id = item.get("id")
                 if isinstance(item_id, str):
-                    seen_ids.add(item_id)
-        if target.stat().st_size > 0:
-            with target.open("rb") as existing_raw:
-                existing_raw.seek(-1, os.SEEK_END)
-                needs_newline = existing_raw.read(1) not in {b"\n", b"\r"}
+                    if item_id not in items_by_id:
+                        ordered_ids.append(item_id)
+                    items_by_id[item_id] = item
+                else:
+                    raw_lines.append(text)
 
-    added = 0
-    skipped = 0
-    with zf.open(archive_path, "r") as src, target.open("a", encoding="utf-8", newline="\n") as dst:
-        if needs_newline:
-            dst.write("\n")
+    changed = 0
+    unchanged = 0
+    with zf.open(archive_path, "r") as src:
         for raw in src:
             text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
             if not text:
@@ -339,18 +355,38 @@ def _merge_jsonl(zf: zipfile.ZipFile, archive_path: str, target: Path) -> tuple[
             try:
                 item = json.loads(text)
             except json.JSONDecodeError:
-                dst.write(text + "\n")
-                added += 1
+                if text not in raw_lines:
+                    raw_lines.append(text)
+                    changed += 1
+                else:
+                    unchanged += 1
                 continue
             item_id = item.get("id")
-            if isinstance(item_id, str) and item_id in seen_ids:
-                skipped += 1
+            if not isinstance(item_id, str):
+                if text not in raw_lines:
+                    raw_lines.append(text)
+                    changed += 1
+                else:
+                    unchanged += 1
                 continue
-            if isinstance(item_id, str):
-                seen_ids.add(item_id)
-            dst.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
-            added += 1
-    return added, skipped
+            previous = items_by_id.get(item_id)
+            if previous is None:
+                ordered_ids.append(item_id)
+                items_by_id[item_id] = item
+                changed += 1
+            elif previous != item:
+                items_by_id[item_id] = item
+                changed += 1
+            else:
+                unchanged += 1
+
+    if changed or not target.exists():
+        with target.open("w", encoding="utf-8", newline="\n") as dst:
+            for item_id in ordered_ids:
+                dst.write(json.dumps(items_by_id[item_id], ensure_ascii=False, separators=(",", ":")) + "\n")
+            for line in raw_lines:
+                dst.write(line + "\n")
+    return changed, unchanged
 
 
 def _sqlite_family(path: Path) -> str | None:
@@ -367,7 +403,12 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [row[1] for row in conn.execute(f'pragma table_info("{table}")')]
 
 
-def _insert_or_ignore_rows(
+def _table_primary_key_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    pk_rows = [row for row in conn.execute(f'pragma table_info("{table}")') if row[5]]
+    return [row[1] for row in sorted(pk_rows, key=lambda row: row[5])]
+
+
+def _insert_or_update_rows(
     source_conn: sqlite3.Connection,
     target_conn: sqlite3.Connection,
     table: str,
@@ -393,7 +434,24 @@ def _insert_or_ignore_rows(
     placeholders = ",".join("?" for _ in columns)
     quoted_cols = ",".join(f'"{col}"' for col in columns)
     select_cols = ",".join(f'"{col}"' for col in columns)
-    inserted = 0
+    pk_columns = [col for col in _table_primary_key_columns(target_conn, table) if col in columns]
+    update_cols = [col for col in columns if col not in pk_columns]
+
+    if pk_columns and update_cols:
+        conflict_cols = ",".join(f'"{col}"' for col in pk_columns)
+        assignments = ",".join(f'"{col}"=excluded."{col}"' for col in update_cols)
+        changed_where = " OR ".join(f'"{table}"."{col}" IS NOT excluded."{col}"' for col in update_cols)
+        sql = (
+            f'insert into "{table}" ({quoted_cols}) values ({placeholders}) '
+            f'on conflict ({conflict_cols}) do update set {assignments} where {changed_where}'
+        )
+    elif pk_columns:
+        conflict_cols = ",".join(f'"{col}"' for col in pk_columns)
+        sql = f'insert into "{table}" ({quoted_cols}) values ({placeholders}) on conflict ({conflict_cols}) do nothing'
+    else:
+        sql = f'insert or ignore into "{table}" ({quoted_cols}) values ({placeholders})'
+
+    changed = 0
     rows = source_conn.execute(f'select {select_cols} from "{table}"')
     for row in rows:
         values = list(row)
@@ -406,13 +464,10 @@ def _insert_or_ignore_rows(
                     suffix = value[len(normalized_source) :].lstrip("\\/")
                     values[idx] = str(Path(target_codex_home) / Path(suffix))
         before = target_conn.total_changes
-        target_conn.execute(
-            f'insert or ignore into "{table}" ({quoted_cols}) values ({placeholders})',
-            values,
-        )
+        target_conn.execute(sql, values)
         if target_conn.total_changes > before:
-            inserted += 1
-    return inserted
+            changed += 1
+    return changed
 
 
 def _merge_sqlite_database(
@@ -435,7 +490,7 @@ def _merge_sqlite_database(
             if not _table_exists(source_conn, table) or not _table_exists(target_conn, table):
                 continue
             try:
-                count = _insert_or_ignore_rows(source_conn, target_conn, table, source_codex_home, target_codex_home)
+                count = _insert_or_update_rows(source_conn, target_conn, table, source_codex_home, target_codex_home)
                 inserted[table] = count
             except (sqlite3.DatabaseError, ValueError) as exc:
                 warnings.append(f"跳过 SQLite 表 {target_db.name}.{table}: {exc}")
@@ -499,6 +554,11 @@ def restore_backup(options: RestoreOptions, progress: ProgressCallback | None = 
                         continue
 
                     if options.mode == "merge" and target.exists():
+                        if _should_repair_existing_record(target, entry.source_size, entry.relative_path):
+                            _extract_zip_entry(zf, entry.archive_path, target, entry.mtime)
+                            restored += 1
+                            warnings.append(f"已修复空壳或截断的对话文件: {entry.relative_path}")
+                            continue
                         if entry.kind == "sqlite" and _sqlite_family(target):
                             temp_db = temp_dir / target.name
                             _extract_zip_entry(zf, entry.archive_path, temp_db)
@@ -538,6 +598,10 @@ def restore_backup(options: RestoreOptions, progress: ProgressCallback | None = 
         "skipped": skipped,
         "snapshot": str(snapshot_path) if snapshot_path else "",
     }
+    if restored == 0 and merged == 0:
+        if source_codex_home and Path(source_codex_home).expanduser() == options.target_codex_home.expanduser():
+            warnings.append("备份来源目录和恢复目标目录相同，没有导入任何新内容。")
+        warnings.append("没有导入任何新内容；目标端可能已有同名记录。若 Codex 里只有项目壳子没有对话，请关闭 Codex 后使用“覆盖恢复”。")
     return OperationResult(True, "恢复完成。", details=details, warnings=warnings)
 
 

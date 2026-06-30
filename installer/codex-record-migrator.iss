@@ -1,6 +1,6 @@
 #define MyAppName "Codex Record Migrator"
 #define MyAppChineseName "Codex 记录备份迁移工具"
-#define MyAppVersion "0.1.1"
+#define MyAppVersion "0.1.2"
 #define MyAppPublisher "Local"
 #define MyAppExeName "CodexRecordMigrator.exe"
 

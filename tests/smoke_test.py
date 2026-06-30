@@ -96,7 +96,11 @@ def main() -> int:
         backup = root / "backup.codexbackup"
         session = source / "sessions" / "2026" / "06" / "26" / "rollout-2026-06-26T00-00-00-thread-a.jsonl"
         session.parent.mkdir(parents=True)
-        session.write_text('{"type":"session_meta","payload":{"id":"thread-a"}}\n', encoding="utf-8")
+        session.write_text(
+            '{"type":"session_meta","payload":{"id":"thread-a"}}\n'
+            '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}\n',
+            encoding="utf-8",
+        )
         (source / "session_index.jsonl").write_text(
             json.dumps({"id": "thread-a", "thread_name": "hello", "updated_at": "2026-06-26T00:00:00Z"}) + "\n",
             encoding="utf-8",
@@ -126,6 +130,30 @@ def main() -> int:
         imported_path = dict(rows)["thread-a"]
         assert str(target) in imported_path
         assert (target / "sqlite" / "codex-dev.db").exists()
+
+        stale_target = root / "stale-target" / ".codex"
+        stale_session = stale_target / "sessions" / "2026" / "06" / "26" / session.name
+        stale_session.parent.mkdir(parents=True)
+        stale_session.write_text("", encoding="utf-8")
+        stale_target.mkdir(parents=True, exist_ok=True)
+        (stale_target / "session_index.jsonl").write_text(
+            json.dumps({"id": "thread-a", "thread_name": "stale", "updated_at": "2026-01-01T00:00:00Z"}) + "\n",
+            encoding="utf-8",
+        )
+        make_state_db(stale_target / "state_5.sqlite", "thread-a", "C:\\missing\\rollout.jsonl")
+        stale_restore = restore_backup(RestoreOptions(backup_path=backup, target_codex_home=stale_target, mode="merge"))
+        assert stale_restore.ok, stale_restore.message
+        assert stale_session.read_text(encoding="utf-8") == session.read_text(encoding="utf-8")
+        stale_index = [json.loads(line) for line in (stale_target / "session_index.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert stale_index[0]["thread_name"] == "hello"
+        conn = sqlite3.connect(stale_target / "state_5.sqlite")
+        try:
+            stale_rollout = conn.execute("select rollout_path from threads where id='thread-a'").fetchone()[0]
+        finally:
+            conn.close()
+        assert str(stale_target) in stale_rollout
+        assert stale_restore.details["restored"] >= 1
+        assert stale_restore.details["merged"] >= 1
 
         newer_target = root / "newer-target" / ".codex"
         newer_target.mkdir(parents=True)

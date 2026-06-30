@@ -1,3 +1,3 @@
 """Codex record backup and migration tool."""
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

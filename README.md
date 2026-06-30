@@ -70,8 +70,9 @@ python .\main.py restore ".\codex.codexbackup" --target "$env:USERPROFILE\.codex
 推荐默认使用“合并，不覆盖已有文件”：
 
 - 对话 JSONL、附件、图片：目标不存在才写入
-- `session_index.jsonl`：按 `id` 去重追加
-- `state_*.sqlite`、`goals_*.sqlite`、`memories_*.sqlite`：如果目标库已存在，会尝试按主键插入缺失记录
+- `session_index.jsonl`：按 `id` 合并，备份包中的同 id 条目会修正目标端旧索引
+- `sessions` / `archived_sessions`：合并模式下会自动修复同名但为空或被截断的对话文件
+- `state_*.sqlite`、`goals_*.sqlite`、`memories_*.sqlite`：如果目标库已存在，会按主键插入或更新备份中已有字段，同时保留目标端新字段
 - 遇到目标端新版本 SQLite 表结构不兼容时，会跳过该表并记录警告，避免中断整个恢复
 - `logs_*.sqlite`：合并模式下已有目标库时跳过
 
